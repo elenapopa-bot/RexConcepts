@@ -22,7 +22,7 @@ from typing import Any
 import browser_cookie3
 import requests
 from dateutil.relativedelta import relativedelta
-from github import Github
+from github import Auth, Github
 
 LOOKER_HOST = "https://bolt.cloud.looker.com"
 PUBLIC_QUERY = LOOKER_HOST + "/api/4.0/queries/run/json"
@@ -401,12 +401,28 @@ def percent_points(raw: Any, field: str) -> float:
     return rendered * 100 if abs(rendered) <= 1 else rendered
 
 
-def summary_cells(row: dict[str, Any]) -> list[str]:
+def summary_cells(row: dict[str, Any], cohort_new_users: int) -> list[str]:
+    """Format the latest-month summary.
+
+    Looker's ``new_users_count`` can be null even when the underlying cohort
+    rows are present. Those rows are already queried for the report's new vs.
+    returning charts, so use the current-month new cohort count as the
+    equivalent summary value instead of publishing a blank cell.
+    """
+    reported_new_users = value(row, SUMMARY_FIELDS[4])
+    if reported_new_users is None or reported_new_users == "":
+        log(
+            "Looker returned null new_users_count; using the current-month "
+            f"cohort count ({cohort_new_users:,}) for the summary"
+        )
+        new_users = cohort_new_users
+    else:
+        new_users = round(number(reported_new_users, SUMMARY_FIELDS[4]))
     return [
         f"{round(number(value(row, SUMMARY_FIELDS[3]), SUMMARY_FIELDS[3])):,}",
         f"{round(number(value(row, SUMMARY_FIELDS[5]), SUMMARY_FIELDS[5]) / 1000)}k €",
         f"{round(number(value(row, SUMMARY_FIELDS[6]), SUMMARY_FIELDS[6]) / 1000)}k €",
-        f"{round(number(value(row, SUMMARY_FIELDS[4]), SUMMARY_FIELDS[4])):,}",
+        f"{new_users:,}",
         f"{number(value(row, SUMMARY_FIELDS[7]), SUMMARY_FIELDS[7]):.2f} €",
         f"{number(value(row, SUMMARY_FIELDS[8]), SUMMARY_FIELDS[8]):.2f} ⭐",
         f"{percent_points(value(row, SUMMARY_FIELDS[9]), SUMMARY_FIELDS[9]):.1f}%",
@@ -473,12 +489,18 @@ def patch_html(
     monthly: dict[str, dict[str, list[Any]]],
     cohorts: dict[str, list[dict[str, Any]]],
     latest: dict[tuple[str, str], dict[str, Any]],
+    cohort_counts_by_month: dict[tuple[str, str, str], dict[str, int]],
     end_month: str,
 ) -> str:
     for name, data in {**arrays, **monthly, **cohorts}.items():
         html = replace_js_const(html, name, js_json(data))
     for (country, brand), row in latest.items():
-        html = replace_summary_row(html, country, brand, summary_cells(row))
+        html = replace_summary_row(
+            html,
+            country,
+            brand,
+            summary_cells(row, cohort_counts_by_month[country, brand, end_month]["new"]),
+        )
     return replace_period_labels(html, end_month)
 
 
@@ -506,7 +528,7 @@ def validate(
 
 
 def load_report(token: str) -> str:
-    github = Github(token)
+    github = Github(auth=Auth.Token(token))
     repo = github.get_repo(REPO_NAME)
     text = repo.get_contents(REPORT_PATH, ref=repo.default_branch).decoded_content.decode("utf-8")
     log(f"Fetched {REPORT_PATH} from {REPO_NAME} ({len(text)} bytes)")
@@ -514,7 +536,7 @@ def load_report(token: str) -> str:
 
 
 def publish(token: str, page: str, end_month: str) -> bool:
-    github = Github(token)
+    github = Github(auth=Auth.Token(token))
     repo = github.get_repo(REPO_NAME)
     contents = repo.get_contents(REPORT_PATH, ref=repo.default_branch)
     current = contents.decoded_content.decode("utf-8")
@@ -581,7 +603,9 @@ def main() -> int:
         for country, brand, prefix in BRANDS
     }
     latest = {(country, brand): summary[country, brand, end_month] for country, brand, _ in BRANDS}
-    updated = patch_html(load_report(token), arrays, monthly, cohorts, latest, end_month)
+    updated = patch_html(
+        load_report(token), arrays, monthly, cohorts, latest, cohort_months, end_month
+    )
     validate(updated, arrays, monthly)
     size_kb = len(updated.encode("utf-8")) / 1024
     if args.dry_run:
