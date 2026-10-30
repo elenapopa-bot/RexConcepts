@@ -527,6 +527,17 @@ def validate(
         raise ValueError("Validation failed:\n - " + "\n - ".join(errors))
 
 
+def report_end_month(html: str) -> str | None:
+    """Return the closed month already shown in the report, such as 2026-09."""
+    found = re.search(
+        r"Jan 2025 – (" + "|".join(SHORT_MONTHS) + r") (\d{4}) · Preliminary",
+        html,
+    )
+    if not found:
+        return None
+    return f"{found.group(2)}-{SHORT_MONTHS.index(found.group(1)) + 1:02d}"
+
+
 def load_report(token: str) -> str:
     github = Github(auth=Auth.Token(token))
     repo = github.get_repo(REPO_NAME)
@@ -557,12 +568,25 @@ def publish(token: str, page: str, end_month: str) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="Fetch and validate without publishing")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Restate the latest closed month even when the report already shows it",
+    )
     args = parser.parse_args()
     log("Rex Concepts update started")
     end_month = last_complete_month()
+    token = load_token()
+    current_html = load_report(token)
+    current_month = report_end_month(current_html)
+    if current_month == end_month and not args.force:
+        log(
+            f"Report already covers {end_month}. "
+            "Leaving it unchanged until the next month closes."
+        )
+        return 0
     months = months_between(START_MONTH, end_month)
     chart_months = months[-11:]
-    token = load_token()
     session = looker_session()
     summary_rows, endpoint = fetch_summary(session, end_month, None)
     if not summary_rows:
@@ -604,7 +628,7 @@ def main() -> int:
     }
     latest = {(country, brand): summary[country, brand, end_month] for country, brand, _ in BRANDS}
     updated = patch_html(
-        load_report(token), arrays, monthly, cohorts, latest, cohort_months, end_month
+        current_html, arrays, monthly, cohorts, latest, cohort_months, end_month
     )
     validate(updated, arrays, monthly)
     size_kb = len(updated.encode("utf-8")) / 1024

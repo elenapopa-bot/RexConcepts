@@ -38,32 +38,21 @@ This is the same mechanism as Hesburger RO: the Mac must be awake, unlocked, and
 
 4. **Looker**: log in to [bolt.cloud.looker.com](https://bolt.cloud.looker.com) in Chrome on the Mac that runs the job.
 
-5. **Run manually**:
+Do not run the script in the middle of a month. If the report already shows the last closed month, the script leaves the file unchanged.
 
-   ```bash
-   source ~/.rex_concepts_env
-   python3 ~/scripts/rex_concepts_update.py
-   ```
-
-   Log: `~/scripts/rex_concepts.log`
+Log: `~/scripts/rex_concepts.log`
 
 ## Cron (Europe/Bucharest)
 
 ```cron
-0 13 * * 1  source $HOME/.rex_concepts_env && /usr/bin/python3 $HOME/scripts/rex_concepts_update.py
-0 13 2 * * source $HOME/.rex_concepts_env && /usr/bin/python3 $HOME/scripts/rex_concepts_update.py
+0 13 2 * * /usr/bin/python3 $HOME/scripts/rex_concepts_update.py
 ```
 
-- **Monday 13:00** — refresh the last closed month (Looker sometimes restates it).
-- **2nd of the month 13:00** — roll the newly closed month into the report.
+On the **2nd of the month at 13:00**, the newly closed month is added. There is no Monday run. The script reads `~/.rex_concepts_env` or, if that file is missing, `~/.hesburger_ro_env`.
 
-If `~/.rex_concepts_env` does not exist, point both lines at `source $HOME/.hesburger_ro_env` instead.
+## Manual run
 
-## Easiest run on Mac (no Cursor)
-
-1. In Finder, open the repo folder → `scripts` → double-click **`run_update.command`**.
-2. If macOS blocks it: right-click → **Open** → **Open** again.
-3. Log in to Looker in Chrome when asked, then press **Enter** in the Terminal window.
+Double-click `scripts/run_update.command` only when you want to check the job. Before the next month closes it reports that the file is already current and does not change it. If macOS blocks the file: right-click → **Open** → **Open** again.
 
 ## Report
 
