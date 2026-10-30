@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Update the Rex Concepts monthly report from Looker.
+"""Pull Rex Concepts metrics from Looker and publish the existing HTML report.
 
-The script intentionally refuses to fill missing data with zeroes: a partial
-Looker result must never overwrite an otherwise correct report.
+Same run path as Hesburger RO: Chrome cookies for Looker, GitHub API write to
+main. The report layout is patched in place. A partial Looker result never
+overwrites the live file.
 """
 
 from __future__ import annotations
@@ -11,20 +12,27 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
+import traceback
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-import looker_sdk
+import browser_cookie3
+import requests
 from dateutil.relativedelta import relativedelta
-from looker_sdk import models40 as models
+from github import Github
 
-ROOT = Path(__file__).resolve().parent
-REPORT = ROOT / "rex_concepts_report.html"
-CACHE = ROOT / "cache"
+LOOKER_HOST = "https://bolt.cloud.looker.com"
+PUBLIC_QUERY = LOOKER_HOST + "/api/4.0/queries/run/json"
+INTERNAL_QUERY = LOOKER_HOST + "/api/internal/core/4.0/queries/run/json"
+REPO_NAME = "elenapopa-bot/RexConcepts"
+REPORT_PATH = "rex_concepts_report.html"
+ENV_FILE = Path.home() / ".rex_concepts_env"
+FALLBACK_ENV_FILE = Path.home() / ".hesburger_ro_env"
+LOG_FILE = Path.home() / "scripts" / "rex_concepts.log"
+
 START_MONTH = "2025-01"
 COUNTRIES = ("Romania", "Czech Republic", "Poland")
 BRANDS = (
@@ -56,6 +64,14 @@ COHORT_FIELDS = [
 ]
 
 
+def log(msg: str) -> None:
+    line = datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + msg
+    print(line, flush=True)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_FILE.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
 def last_complete_month() -> str:
     first = date.today().replace(day=1)
     return (first - relativedelta(months=1)).strftime("%Y-%m")
@@ -80,18 +96,28 @@ def js_json(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), allow_nan=False)
 
 
-def configure_looker() -> None:
-    required = ("LOOKER_BASE_URL", "LOOKER_CLIENT_ID", "LOOKER_CLIENT_SECRET")
-    missing = [name for name in required if not os.environ.get(name)]
-    if missing:
-        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
-    ini = f"""[Looker]
-base_url={os.environ['LOOKER_BASE_URL']}
-client_id={os.environ['LOOKER_CLIENT_ID']}
-client_secret={os.environ['LOOKER_CLIENT_SECRET']}
-verify_ssl=true
-"""
-    Path.home().joinpath(".looker.ini").write_text(ini, encoding="utf-8")
+def token_from_file(path: Path) -> str:
+    if not path.exists():
+        return ""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):]
+        if line.startswith("GITHUB_TOKEN=") or line.startswith("GH_TOKEN="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
+def load_token() -> str:
+    token = os.environ.get("GITHUB_TOKEN", "").strip() or os.environ.get("GH_TOKEN", "").strip()
+    if token:
+        return token
+    token = token_from_file(ENV_FILE) or token_from_file(FALLBACK_ENV_FILE)
+    if token:
+        return token
+    raise RuntimeError(
+        f"GITHUB_TOKEN not found in the environment, {ENV_FILE}, or {FALLBACK_ENV_FILE}"
+    )
 
 
 def value(row: dict[str, Any], field: str) -> Any:
@@ -119,75 +145,92 @@ def normalize_month(raw: Any) -> str:
     return match.group(0)
 
 
-def cache_json(path: Path, fetch: callable) -> list[dict[str, Any]]:
-    CACHE.mkdir(exist_ok=True)
-    if path.exists():
-        print(f"Using cached {path.relative_to(ROOT)}")
-        return json.loads(path.read_text(encoding="utf-8"))
-    rows = fetch()
-    path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
-    print(f"Cached {len(rows)} rows in {path.relative_to(ROOT)}")
-    return rows
+def looker_session() -> requests.Session:
+    jar = list(browser_cookie3.chrome(domain_name="bolt.cloud.looker.com"))
+    session = requests.Session()
+    csrf = None
+    for cookie in jar:
+        session.cookies.set(cookie.name, cookie.value, domain=cookie.domain)
+        if cookie.name == "CSRF-TOKEN":
+            csrf = cookie.value
+    if not csrf:
+        raise RuntimeError(
+            "No Looker CSRF cookie in Chrome. Log in to bolt.cloud.looker.com and retry."
+        )
+    session.headers.update({
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-CSRF-Token": csrf,
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": LOOKER_HOST,
+        "Referer": LOOKER_HOST + "/explore/curated_delivery/food_providers_metrics_aggregated",
+    })
+    log(f"Loaded {len(jar)} Looker cookies from Chrome")
+    return session
 
 
-def run_query(sdk: Any, query: models.WriteQuery) -> list[dict[str, Any]]:
-    created = sdk.create_query(body=query)
-    raw = sdk.run_query(query_id=created.id, result_format="json")
-    result = json.loads(raw)
-    if not isinstance(result, list):
-        raise ValueError("Looker returned a non-list query result")
-    return result
+def run_query(session: requests.Session, endpoint: str | None, body: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
+    params = {"apply_formatting": "false", "cache": "false"}
+    last = None
+    urls: list[str] = []
+    if endpoint:
+        urls.append(endpoint)
+    for url in (PUBLIC_QUERY, INTERNAL_QUERY):
+        if url not in urls:
+            urls.append(url)
+    for url in urls:
+        response = session.post(url, params=params, json=body, timeout=180)
+        if response.status_code == 200 and response.text.lstrip().startswith("["):
+            data = response.json()
+            log(f"Looker query ok via {url} ({len(data)} rows)")
+            return data, url
+        snippet = response.text[:240].replace("\n", " ")
+        last = f"{url} -> {response.status_code} {snippet}"
+        log(f"Looker query not accepted: {last}")
+    raise RuntimeError("Looker query failed: " + (last or "no response"))
 
 
-def fetch_summary(sdk: Any, end_month: str) -> list[dict[str, Any]]:
-    path = CACHE / f"summary_{end_month}.json"
-    return cache_json(
-        path,
-        lambda: run_query(
-            sdk,
-            models.WriteQuery(
-                model="curated_delivery",
-                view="food_providers_metrics_aggregated",
-                fields=SUMMARY_FIELDS,
-                filters={
-                    "food_providers_metrics_aggregated.group_name": "REX CONCEPTS",
-                    "food_providers_metrics_aggregated.country_name": ", ".join(COUNTRIES),
-                    "food_providers_metrics_aggregated.report_period_month": (
-                        f"2025-01-01 to {end_month}-28"
-                    ),
-                },
-                sorts=[
-                    "food_providers_metrics_aggregated.country_name",
-                    "food_providers_metrics_aggregated.brand_name",
-                    "food_providers_metrics_aggregated.report_period_month",
-                ],
-                limit="500",
-            ),
-        ),
-    )
+def fetch_summary(session: requests.Session, end_month: str, endpoint: str | None) -> tuple[list[dict[str, Any]], str]:
+    body = {
+        "model": "curated_delivery",
+        "view": "food_providers_metrics_aggregated",
+        "fields": SUMMARY_FIELDS,
+        "filters": {
+            "food_providers_metrics_aggregated.group_name": "REX CONCEPTS",
+            "food_providers_metrics_aggregated.country_name": ", ".join(COUNTRIES),
+            "food_providers_metrics_aggregated.report_period_month": f"2025-01-01 to {end_month}-28",
+        },
+        "sorts": [
+            "food_providers_metrics_aggregated.country_name",
+            "food_providers_metrics_aggregated.brand_name",
+            "food_providers_metrics_aggregated.report_period_month",
+        ],
+        "limit": "500",
+    }
+    return run_query(session, endpoint, body)
 
 
-def fetch_cohorts(sdk: Any, months: list[str]) -> dict[str, list[dict[str, Any]]]:
+def fetch_cohorts(
+    session: requests.Session, months: list[str], endpoint: str | None
+) -> tuple[dict[str, list[dict[str, Any]]], str]:
     results: dict[str, list[dict[str, Any]]] = {}
     for order_month in months:
-        results[order_month] = cache_json(
-            CACHE / f"cohort_{order_month}.json",
-            lambda order_month=order_month: run_query(
-                sdk,
-                models.WriteQuery(
-                    model="curated_delivery",
-                    view="dim_order_delivery__ai",
-                    fields=COHORT_FIELDS,
-                    filters={
-                        "dim_order_delivery_common.order_created_date_local_month": order_month,
-                        "dim_provider_common.country_name": ", ".join(COUNTRIES),
-                        "dim_provider_common.group_name": "REX CONCEPTS",
-                    },
-                    limit="50000",
-                ),
-            ),
-        )
-    return results
+        body = {
+            "model": "curated_delivery",
+            "view": "dim_order_delivery__ai",
+            "fields": COHORT_FIELDS,
+            "filters": {
+                "dim_order_delivery_common.order_created_date_local_month": order_month,
+                "dim_provider_common.country_name": ", ".join(COUNTRIES),
+                "dim_provider_common.group_name": "REX CONCEPTS",
+            },
+            "limit": "50000",
+        }
+        rows, endpoint = run_query(session, endpoint, body)
+        if not rows:
+            raise RuntimeError(f"Cohort query returned no rows for {order_month}")
+        results[order_month] = rows
+    return results, endpoint or ""
 
 
 def summary_index(rows: list[dict[str, Any]]) -> dict[tuple[str, str, str], dict[str, Any]]:
@@ -195,7 +238,7 @@ def summary_index(rows: list[dict[str, Any]]) -> dict[tuple[str, str, str], dict
     for row in rows:
         orders = number(value(row, SUMMARY_FIELDS[3]), SUMMARY_FIELDS[3])
         if orders == 0:
-            print(f"WARNING: skipping zero-order summary row: {row}", file=sys.stderr)
+            log(f"WARNING: skipping zero-order summary row: {row}")
             continue
         key = (
             str(value(row, SUMMARY_FIELDS[2])),
@@ -385,12 +428,12 @@ def replace_summary_row(html: str, country: str, brand: str, cells: list[str]) -
     match = matches[0]
     existing_cells = re.findall(r"<td[^>]*>.*?</td>", match.group(2))
     updated_cells = [
-        re.sub(r"(<td[^>]*>).*?(</td>)", lambda match: f"{match.group(1)}{cell}{match.group(2)}", existing, count=1)
+        re.sub(r"(<td[^>]*>).*?(</td>)", lambda found: f"{found.group(1)}{cell}{found.group(2)}", existing, count=1)
         for existing, cell in zip(existing_cells[:8], cells)
     ]
     updated_cells.append(existing_cells[8])
     replacement = match.group(1) + "".join(updated_cells) + match.group(3)
-    section = section[:match.start()] + replacement + section[match.end():]
+    section = section[: match.start()] + replacement + section[match.end():]
     return html[:start] + section + html[end:]
 
 
@@ -462,42 +505,50 @@ def validate(
         raise ValueError("Validation failed:\n - " + "\n - ".join(errors))
 
 
-def push(end_month: str) -> bool:
-    token = os.environ.get("GH_TOKEN")
-    if not token:
-        raise RuntimeError("GH_TOKEN is required to push changes")
-    subprocess.run(["git", "config", "user.email", "bot@rexconcepts.com"], cwd=ROOT, check=True)
-    subprocess.run(["git", "config", "user.name", "elena-bot"], cwd=ROOT, check=True)
-    subprocess.run(["git", "add", "rex_concepts_report.html"], cwd=ROOT, check=True)
-    staged = subprocess.run(
-        ["git", "diff", "--staged", "--quiet"], cwd=ROOT, check=False
-    ).returncode
-    if staged == 0:
-        print("Report is unchanged; skipping commit and push.")
+def load_report(token: str) -> str:
+    github = Github(token)
+    repo = github.get_repo(REPO_NAME)
+    text = repo.get_contents(REPORT_PATH, ref=repo.default_branch).decoded_content.decode("utf-8")
+    log(f"Fetched {REPORT_PATH} from {REPO_NAME} ({len(text)} bytes)")
+    return text
+
+
+def publish(token: str, page: str, end_month: str) -> bool:
+    github = Github(token)
+    repo = github.get_repo(REPO_NAME)
+    contents = repo.get_contents(REPORT_PATH, ref=repo.default_branch)
+    current = contents.decoded_content.decode("utf-8")
+    if current == page:
+        log(f"{REPORT_PATH} already matches this run; no commit created")
         return False
-    subprocess.run(
-        ["git", "commit", "-m", f"Monthly update: {end_month} — auto-generated"],
-        cwd=ROOT,
-        check=True,
+    repo.update_file(
+        REPORT_PATH,
+        f"Update Rex Concepts report {datetime.now().strftime('%Y-%m-%d')}",
+        page,
+        contents.sha,
+        branch=repo.default_branch,
     )
-    # Do not persist a credential-bearing remote URL in .git/config.
-    remote = f"https://x-access-token:{token}@github.com/elenapopa-bot/RexConcepts.git"
-    subprocess.run(["git", "push", remote, "HEAD:main"], cwd=ROOT, check=True)
+    log(f"Pushed {REPORT_PATH} through {end_month} to {REPO_NAME} branch {repo.default_branch}")
     return True
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true", help="Fetch and validate without writing or pushing")
+    parser.add_argument("--dry-run", action="store_true", help="Fetch and validate without publishing")
     args = parser.parse_args()
+    log("Rex Concepts update started")
     end_month = last_complete_month()
     months = months_between(START_MONTH, end_month)
     chart_months = months[-11:]
-    configure_looker()
-    sdk = looker_sdk.init40()
-    summary = summary_index(fetch_summary(sdk, end_month))
+    token = load_token()
+    session = looker_session()
+    summary_rows, endpoint = fetch_summary(session, end_month, None)
+    if not summary_rows:
+        raise RuntimeError(f"Summary query returned no rows through {end_month}")
+    summary = summary_index(summary_rows)
     require_summary_rows(summary, chart_months)
-    cohort_months, retained = cohort_counts(fetch_cohorts(sdk, months))
+    cohort_rows, _endpoint = fetch_cohorts(session, months, endpoint)
+    cohort_months, retained = cohort_counts(cohort_rows)
 
     array_fields = {
         "SALES_BEFORE_RO_BK_EUR": ("Romania", "BURGER KING", SUMMARY_FIELDS[5]),
@@ -529,30 +580,25 @@ def main() -> int:
         f"{prefix}_C": cohort_array(country, brand, months, end_month, retained)
         for country, brand, prefix in BRANDS
     }
-    if not REPORT.exists():
-        raise FileNotFoundError(f"Report template not found: {REPORT}")
     latest = {(country, brand): summary[country, brand, end_month] for country, brand, _ in BRANDS}
-    updated = patch_html(REPORT.read_text(encoding="utf-8"), arrays, monthly, cohorts, latest, end_month)
-    validate(updated, {name: arrays[name] for name in list(arrays)[:8]}, monthly)
+    updated = patch_html(load_report(token), arrays, monthly, cohorts, latest, end_month)
+    validate(updated, arrays, monthly)
     size_kb = len(updated.encode("utf-8")) / 1024
     if args.dry_run:
-        changed = updated != REPORT.read_text(encoding="utf-8")
-        print(f"Dry run: report {'would change' if changed else 'is unchanged'}; no files or git state changed.")
+        log(f"Dry run: report validated for {end_month}; nothing published")
     else:
-        REPORT.write_text(updated, encoding="utf-8")
-        push(end_month)
-    print(f"""✅ Rex Concepts report updated — {end_month}
-   Sales arrays:   8 arrays × 11 months
-   Cohort arrays:  4 brands × {len(months)} cohorts
-   Monthly arrays: 4 brands × 11 months
-   HTML size:      {size_kb:.1f}KB
-   Pushed to:      https://github.com/elenapopa-bot/RexConcepts.git""")
+        publish(token, updated, end_month)
+    log(
+        f"SUCCESS Rex Concepts report {end_month}: "
+        f"8 sales arrays, 4 cohort brands, 4 monthly series, {size_kb:.1f}KB"
+    )
     return 0
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except Exception as error:
-        print(f"ERROR: {error}", file=sys.stderr)
+    except Exception:
+        log("FAILED\n" + traceback.format_exc())
+        print(f"ERROR: see {LOG_FILE}", file=sys.stderr)
         raise SystemExit(1)
